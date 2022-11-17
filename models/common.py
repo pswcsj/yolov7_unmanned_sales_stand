@@ -22,11 +22,13 @@ from utils.torch_utils import time_synchronized
 
 def autopad(k, p=None):  # kernel, padding
     # Pad to 'same'
+    # 원래 이미지 사이즈와 같은 사이즈가 나오게 하는 padding 값을 찾아서 반환
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
 
+# kernel_size = k, stride = k인 Max Pool
 class MP(nn.Module):
     def __init__(self, k=2):
         super(MP, self).__init__()
@@ -43,16 +45,18 @@ class SP(nn.Module):
 
     def forward(self, x):
         return self.m(x)
-    
-    
+
+
 class ReOrg(nn.Module):
     def __init__(self):
         super(ReOrg, self).__init__()
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
+        # a:b:c는 a에서 b-1까치 c씩 건너뛴다는 의미 따라서 ::2는 처음부터 끝가지 2칸씩 뛰어넘는다는 뜻
         return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
 
 
+# 차원을 정해준 후, 함숫값을 넣으면 그 차원에 대해 concat을 실행하는 함
 class Concat(nn.Module):
     def __init__(self, dimension=1):
         super(Concat, self).__init__()
@@ -74,16 +78,17 @@ class Chuncat(nn.Module):
             xi1, xi2 = xi.chunk(2, self.d)
             x1.append(xi1)
             x2.append(xi2)
-        return torch.cat(x1+x2, self.d)
+        return torch.cat(x1 + x2, self.d)
 
 
+# x[0]과 x[1]을 합쳐줌
 class Shortcut(nn.Module):
     def __init__(self, dimension=0):
         super(Shortcut, self).__init__()
         self.d = dimension
 
     def forward(self, x):
-        return x[0]+x[1]
+        return x[0] + x[1]
 
 
 class Foldcut(nn.Module):
@@ -93,9 +98,10 @@ class Foldcut(nn.Module):
 
     def forward(self, x):
         x1, x2 = x.chunk(2, self.d)
-        return x1+x2
+        return x1 + x2
 
 
+# Conv, Batch Norm, Activation을 하나의 레이어로 묶음
 class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
@@ -103,17 +109,21 @@ class Conv(nn.Module):
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        # 만약 act가 True면 SiLU 사용, act에 인자로 함수가 입력되었으면 그것을 사용하고 그것도 아니라면 Identity Mapping
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.bn(self.conv(x)))  # forward pass
 
     def fuseforward(self, x):
         return self.act(self.conv(x))
-    
+        # batch norm 생략한 버전. conv의 weight와 bias를 바꾸면 conv와 bn을 합칠 수 있기에 이렇게 함
+        # RepConv에서 사용
+
 
 class RobustConv(nn.Module):
     # Robust convolution (use high kernel size 7-11 for: downsampling and other layers). Train for 300 - 450 epochs.
-    def __init__(self, c1, c2, k=7, s=1, p=None, g=1, act=True, layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=7, s=1, p=None, g=1, act=True,
+                 layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
         super(RobustConv, self).__init__()
         self.conv_dw = Conv(c1, c1, k=k, s=s, p=p, g=c1, act=act)
         self.conv1x1 = nn.Conv2d(c1, c2, 1, 1, 0, groups=1, bias=True)
@@ -123,26 +133,27 @@ class RobustConv(nn.Module):
         x = x.to(memory_format=torch.channels_last)
         x = self.conv1x1(self.conv_dw(x))
         if self.gamma is not None:
-            x = x.mul(self.gamma.reshape(1, -1, 1, 1)) 
+            x = x.mul(self.gamma.reshape(1, -1, 1, 1))
         return x
 
 
 class RobustConv2(nn.Module):
     # Robust convolution 2 (use [32, 5, 2] or [32, 7, 4] or [32, 11, 8] for one of the paths in CSP).
-    def __init__(self, c1, c2, k=7, s=4, p=None, g=1, act=True, layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=7, s=4, p=None, g=1, act=True,
+                 layer_scale_init_value=1e-6):  # ch_in, ch_out, kernel, stride, padding, groups
         super(RobustConv2, self).__init__()
         self.conv_strided = Conv(c1, c1, k=k, s=s, p=p, g=c1, act=act)
-        self.conv_deconv = nn.ConvTranspose2d(in_channels=c1, out_channels=c2, kernel_size=s, stride=s, 
+        self.conv_deconv = nn.ConvTranspose2d(in_channels=c1, out_channels=c2, kernel_size=s, stride=s,
                                               padding=0, bias=True, dilation=1, groups=1
-        )
+                                              )
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(c2)) if layer_scale_init_value > 0 else None
 
     def forward(self, x):
         x = self.conv_deconv(self.conv_strided(x))
         if self.gamma is not None:
-            x = x.mul(self.gamma.reshape(1, -1, 1, 1)) 
+            x = x.mul(self.gamma.reshape(1, -1, 1, 1))
         return x
-    
+
 
 def DWConv(c1, c2, k=1, s=1, act=True):
     # Depthwise convolution
@@ -166,7 +177,7 @@ class Stem(nn.Module):
     # Stem
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Stem, self).__init__()
-        c_ = int(c2/2)  # hidden channels
+        c_ = int(c2 / 2)  # hidden channels
         self.cv1 = Conv(c1, c_, 3, 2)
         self.cv2 = Conv(c_, c_, 1, 1)
         self.cv3 = Conv(c_, c_, 3, 2)
@@ -183,13 +194,13 @@ class DownC(nn.Module):
     def __init__(self, c1, c2, n=1, k=2):
         super(DownC, self).__init__()
         c_ = int(c1)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2//2, 3, k)
-        self.cv3 = Conv(c1, c2//2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1)  # input ch, output ch, kernel, stride
+        self.cv2 = Conv(c_, c2 // 2, 3, k)
+        self.cv3 = Conv(c1, c2 // 2, 1, 1)
         self.mp = nn.MaxPool2d(kernel_size=k, stride=k)
 
     def forward(self, x):
-        return torch.cat((self.cv2(self.cv1(x)), self.cv3(self.mp(x))), dim=1)
+        return torch.cat((self.cv2(self.cv1(x)), self.cv3(self.mp(x))), dim=1)  # 채널 수가 c2로 바뀌고 spatial dim이 절반으 줄어듦
 
 
 class SPP(nn.Module):
@@ -204,7 +215,7 @@ class SPP(nn.Module):
     def forward(self, x):
         x = self.cv1(x)
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
-    
+
 
 class Bottleneck(nn.Module):
     # Darknet bottleneck
@@ -254,6 +265,7 @@ class Ghost(nn.Module):
     def forward(self, x):
         return self.conv(x) + self.shortcut(x)
 
+
 ##### end of basic #####
 
 
@@ -261,6 +273,7 @@ class Ghost(nn.Module):
 
 class SPPCSPC(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
+    # CSPNet에서 Block 부분에 SPP를 적용한 네트워크
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13)):
         super(SPPCSPC, self).__init__()
         c_ = int(2 * c2 * e)  # hidden channels
@@ -268,16 +281,19 @@ class SPPCSPC(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(c_, c_, 3, 1)
         self.cv4 = Conv(c_, c_, 1, 1)
-        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+        self.m = nn.ModuleList(
+            [nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])  # 이미지 사이즈에 관계없이 원래 사이즈로 잘 나옴
         self.cv5 = Conv(4 * c_, c_, 1, 1)
         self.cv6 = Conv(c_, c_, 3, 1)
         self.cv7 = Conv(2 * c_, c2, 1, 1)
 
     def forward(self, x):
-        x1 = self.cv4(self.cv3(self.cv1(x)))
-        y1 = self.cv6(self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))
-        y2 = self.cv2(x)
+        x1 = self.cv4(self.cv3(self.cv1(x)))  # part2 부분
+        y1 = self.cv6(
+            self.cv5(torch.cat([x1] + [m(x1) for m in self.m], 1)))  # cv5까지 SSP block임 이후 transition layer에서 cv6 적용
+        y2 = self.cv2(x)  # part1
         return self.cv7(torch.cat((y1, y2), dim=1))
+
 
 class GhostSPPCSPC(SPPCSPC):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -297,12 +313,12 @@ class GhostStem(Stem):
     # Stem
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__(c1, c2, k, s, p, g, act)
-        c_ = int(c2/2)  # hidden channels
+        c_ = int(c2 / 2)  # hidden channels
         self.cv1 = GhostConv(c1, c_, 3, 2)
         self.cv2 = GhostConv(c_, c_, 1, 1)
         self.cv3 = GhostConv(c_, c_, 3, 2)
         self.cv4 = GhostConv(2 * c_, c2, 1, 1)
-        
+
 
 class BottleneckCSPA(nn.Module):
     # CSP https://github.com/WongKinYiu/CrossStagePartialNetworks
@@ -425,24 +441,27 @@ class GhostCSPC(BottleneckCSPC):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*[Ghost(c_, c_) for _ in range(n)])
 
+
 ##### end of cspnet #####
 
 
 ##### yolor #####
 
+# Implicit Addition
 class ImplicitA(nn.Module):
     def __init__(self, channel, mean=0., std=.02):
         super(ImplicitA, self).__init__()
         self.channel = channel
         self.mean = mean
         self.std = std
-        self.implicit = nn.Parameter(torch.zeros(1, channel, 1, 1))
-        nn.init.normal_(self.implicit, mean=self.mean, std=self.std)
+        self.implicit = nn.Parameter(torch.zeros(1, channel, 1, 1))  # 0으로 초기화
+        nn.init.normal_(self.implicit, mean=self.mean, std=self.std)  # self.implicit을 정규분포에 따라 초기화
 
     def forward(self, x):
-        return self.implicit + x
-    
+        return self.implicit + x  # x와 implicit을 더한 값을 반환: x에 implicit에서 각 채널에서 생성된 값이 더해짐
 
+
+# Implicit Multiplication
 class ImplicitM(nn.Module):
     def __init__(self, channel, mean=1., std=.02):
         super(ImplicitM, self).__init__()
@@ -453,8 +472,9 @@ class ImplicitM(nn.Module):
         nn.init.normal_(self.implicit, mean=self.mean, std=self.std)
 
     def forward(self, x):
-        return self.implicit * x
-    
+        return self.implicit * x  # 위의과정이 곱셈으로 바뀐 것
+
+
 ##### end of yolor #####
 
 
@@ -475,37 +495,46 @@ class RepConv(nn.Module):
         assert k == 3
         assert autopad(k, p) == 1
 
-        padding_11 = autopad(k, p) - k // 2
+        padding_11 = autopad(k, p) - k // 2  # autopad(k, p) = k//2: k//2-k//2=0
 
+        # activation 함수
         self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
-        if deploy:
-            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
+        if deploy:  # 만약 deploy 즉, inference하는 상황이면 inference의 속도를 높이기 위해 reparam 사용
+            self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)  # reparam layer 정의
 
         else:
+            # identity mapping
+            # 만약 input channel과 output channel의 수가 같고 stride=1이면 BatchNorm을 실행, 아니면 None
             self.rbr_identity = (nn.BatchNorm2d(num_features=c1) if c2 == c1 and s == 1 else None)
 
+            # kxk conv layer
             self.rbr_dense = nn.Sequential(
+                # kxk conv layer
                 nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
                 nn.BatchNorm2d(num_features=c2),
             )
 
+            # 1x1 conv layer
             self.rbr_1x1 = nn.Sequential(
-                nn.Conv2d( c1, c2, 1, s, padding_11, groups=g, bias=False),
+                # 1x1 conv layer
+                # autopad(k, p) 대신 padding_11을 사용하였는데 1x1 conv는 padding=0을 줘야하기에 이렇게 준다고 볼 수 있음
+                nn.Conv2d(c1, c2, 1, s, padding_11, groups=g, bias=False),
                 nn.BatchNorm2d(num_features=c2),
             )
 
     def forward(self, inputs):
-        if hasattr(self, "rbr_reparam"):
-            return self.act(self.rbr_reparam(inputs))
+        if hasattr(self, "rbr_reparam"):  # 만약 attribute rbr_reparam이 정의되어 있으면
+            return self.act(self.rbr_reparam(inputs))  # 3개의 layer을 하나로 합친 rbr_reparam layer에 값을 넣은 후 activation 함수 ㄱ실행
 
-        if self.rbr_identity is None:
-            id_out = 0
-        else:
-            id_out = self.rbr_identity(inputs)
+        if self.rbr_identity is None:  # 만약 identity가 정의되지 않았다면
+            id_out = 0  # id_out=0
+        else:  # 정의 되어 있다면
+            id_out = self.rbr_identity(inputs)  # id_out을 inputs에 batch norm을 적용한 값으로 저장함
 
-        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
-    
+        return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)  # 모든 값을 합친 후 값 리턴
+
+    # repconv 하나를 하나의 3x3 레이어로 합치기 위해 kernel과 bias를 반환하는 함수
     def get_equivalent_kernel_bias(self):
         kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
         kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
@@ -519,22 +548,28 @@ class RepConv(nn.Module):
         if kernel1x1 is None:
             return 0
         else:
-            return nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+            # 1x1 kernel의 마지막 차원에 (1,1)패딩, 마지막에서 두번째 차원에 (1,1) 패딩
+            return nn.functional.pad(kernel1x1, [1, 1, 1, 1]) #이렇게 하면 3x3 kernel로 padding의 기본값은 0
 
+    # 해당 branch의 등가 kernel과 bias 반환
     def _fuse_bn_tensor(self, branch):
+        # 만약 branch가 None, 예를 들면 rbr_identity가 정의되지 않았다면
         if branch is None:
-            return 0, 0
+            return 0, 0  # kernel=0, bias=0인 레이어와 같으니 0, 0 반환
+
+        # 만약 1x1 Conv layer 또는 3x3 Conv layer이라면
         if isinstance(branch, nn.Sequential):
-            kernel = branch[0].weight
-            running_mean = branch[1].running_mean
-            running_var = branch[1].running_var
-            gamma = branch[1].weight
-            beta = branch[1].bias
-            eps = branch[1].eps
-        else:
+            kernel = branch[0].weight #kernel
+            running_mean = branch[1].running_mean  # batch norm을 학습할 동안 계산한 x의 평균의 평균
+            running_var = branch[1].running_var  # batch norm을 학습할 동안 계산한 분산의 평균의 평균값
+            gamma = branch[1].weight  # batch norm에서 weight
+            beta = branch[1].bias  # batch norm에서 상수
+            eps = branch[1].eps  # batch norm 실행할 때 분모가 0이 되는 것을 방지하는 값, 기본값=1e-5
+
+        else:  # 만약 identity mapping 이라면
             assert isinstance(branch, nn.BatchNorm2d)
-            if not hasattr(self, "id_tensor"):
-                input_dim = self.in_channels // self.groups
+            if not hasattr(self, "id_tensor"): #만약 id_tensor
+                input_dim = self.in_channels // self.groups #
                 kernel_value = np.zeros(
                     (self.in_channels, input_dim, 3, 3), dtype=np.float32
                 )
@@ -547,17 +582,20 @@ class RepConv(nn.Module):
             gamma = branch.weight
             beta = branch.bias
             eps = branch.eps
-        std = (running_var + eps).sqrt()
+        std = (running_var + eps).sqrt() #분모
         t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta - running_mean * gamma / std
+        return kernel * t, beta - running_mean * gamma / std #대응되는 kernel과 bias 출력
 
+    # 모든 branch를 하나의 conv layer로 합친 것을 얻은 후 kernel과 bias를 cpu로 보내고, numpy 자료형으로 반환한 자료를 얻는 함수
     def repvgg_convert(self):
-        kernel, bias = self.get_equivalent_kernel_bias()
-        return (
+        kernel, bias = self.get_equivalent_kernel_bias() #등가 kernel, bias를 얻는다
+        return ( #반환
+            #detach() 함수로 requires_grad=False인 복제 tensor를 만들고, cpu에 올린 다음 numpy로 변환한다.
             kernel.detach().cpu().numpy(),
             bias.detach().cpu().numpy(),
         )
 
+    # conv와 batch norm을 하나의 conv layer로 만들어주는 함수. 합쳐준 후 conv 객체를 반환함
     def fuse_conv_bn(self, conv, bn):
 
         std = (bn.running_var + bn.eps).sqrt()
@@ -567,66 +605,67 @@ class RepConv(nn.Module):
         weights = conv.weight * t
 
         bn = nn.Identity()
-        conv = nn.Conv2d(in_channels = conv.in_channels,
-                              out_channels = conv.out_channels,
-                              kernel_size = conv.kernel_size,
-                              stride=conv.stride,
-                              padding = conv.padding,
-                              dilation = conv.dilation,
-                              groups = conv.groups,
-                              bias = True,
-                              padding_mode = conv.padding_mode)
+        conv = nn.Conv2d(in_channels=conv.in_channels,
+                         out_channels=conv.out_channels,
+                         kernel_size=conv.kernel_size,
+                         stride=conv.stride,
+                         padding=conv.padding,
+                         dilation=conv.dilation,
+                         groups=conv.groups,
+                         bias=True,
+                         padding_mode=conv.padding_mode)
 
         conv.weight = torch.nn.Parameter(weights)
         conv.bias = torch.nn.Parameter(bias)
         return conv
 
-    def fuse_repvgg_block(self):    
-        if self.deploy:
+    def fuse_repvgg_block(self):
+        if self.deploy: #만약 deploy 즉, inference 모드에서 사용할 하나로 합쳐진 conv layer이면 종료
             return
         print(f"RepConv.fuse_repvgg_block")
-                
-        self.rbr_dense = self.fuse_conv_bn(self.rbr_dense[0], self.rbr_dense[1])
-        
-        self.rbr_1x1 = self.fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1])
-        rbr_1x1_bias = self.rbr_1x1.bias
-        weight_1x1_expanded = torch.nn.functional.pad(self.rbr_1x1.weight, [1, 1, 1, 1])
-        
-        # Fuse self.rbr_identity
-        if (isinstance(self.rbr_identity, nn.BatchNorm2d) or isinstance(self.rbr_identity, nn.modules.batchnorm.SyncBatchNorm)):
+
+        self.rbr_dense = self.fuse_conv_bn(self.rbr_dense[0], self.rbr_dense[1]) #k x k conv layer에서 conv와 bn을 하나의 k x k conv로 합침
+
+        self.rbr_1x1 = self.fuse_conv_bn(self.rbr_1x1[0], self.rbr_1x1[1]) #1x1도 하나로 합침
+        rbr_1x1_bias = self.rbr_1x1.bias #1x1 conv layer의 bias를 가져와 저장
+        weight_1x1_expanded = torch.nn.functional.pad(self.rbr_1x1.weight, [1, 1, 1, 1]) #kernel의 padding를 늘려줘서 3x3으로 맞춤
+
+        # Fuse self.rbr_identity 만약 rbr_identity가 BatchNorm이라면 즉, 정의되어 있다면
+        if (isinstance(self.rbr_identity, nn.BatchNorm2d) or isinstance(self.rbr_identity,
+                                                                        nn.modules.batchnorm.SyncBatchNorm)):
             # print(f"fuse: rbr_identity == BatchNorm2d or SyncBatchNorm")
             identity_conv_1x1 = nn.Conv2d(
-                    in_channels=self.in_channels,
-                    out_channels=self.out_channels,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    groups=self.groups, 
-                    bias=False)
-            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.to(self.rbr_1x1.weight.data.device)
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                groups=self.groups,
+                bias=False)
+            identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.to(self.rbr_1x1.weight.data.device) #weight를 device로 보냄
             identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.squeeze().squeeze()
             # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
-            identity_conv_1x1.weight.data.fill_(0.0)
+            identity_conv_1x1.weight.data.fill_(0.0) #함수 뒤에 _는 inplace 즉, 변수의 값에 변경이 반영된 것을 뜻함
             identity_conv_1x1.weight.data.fill_diagonal_(1.0)
             identity_conv_1x1.weight.data = identity_conv_1x1.weight.data.unsqueeze(2).unsqueeze(3)
             # print(f" identity_conv_1x1.weight = {identity_conv_1x1.weight.shape}")
 
             identity_conv_1x1 = self.fuse_conv_bn(identity_conv_1x1, self.rbr_identity)
             bias_identity_expanded = identity_conv_1x1.bias
-            weight_identity_expanded = torch.nn.functional.pad(identity_conv_1x1.weight, [1, 1, 1, 1])            
+            weight_identity_expanded = torch.nn.functional.pad(identity_conv_1x1.weight, [1, 1, 1, 1])
         else:
             # print(f"fuse: rbr_identity != BatchNorm2d, rbr_identity = {self.rbr_identity}")
-            bias_identity_expanded = torch.nn.Parameter( torch.zeros_like(rbr_1x1_bias) )
-            weight_identity_expanded = torch.nn.Parameter( torch.zeros_like(weight_1x1_expanded) )            
-        
+            bias_identity_expanded = torch.nn.Parameter(torch.zeros_like(rbr_1x1_bias))
+            weight_identity_expanded = torch.nn.Parameter(torch.zeros_like(weight_1x1_expanded))
 
-        #print(f"self.rbr_1x1.weight = {self.rbr_1x1.weight.shape}, ")
-        #print(f"weight_1x1_expanded = {weight_1x1_expanded.shape}, ")
-        #print(f"self.rbr_dense.weight = {self.rbr_dense.weight.shape}, ")
+            # print(f"self.rbr_1x1.weight = {self.rbr_1x1.weight.shape}, ")
+        # print(f"weight_1x1_expanded = {weight_1x1_expanded.shape}, ")
+        # print(f"self.rbr_dense.weight = {self.rbr_dense.weight.shape}, ")
 
-        self.rbr_dense.weight = torch.nn.Parameter(self.rbr_dense.weight + weight_1x1_expanded + weight_identity_expanded)
+        self.rbr_dense.weight = torch.nn.Parameter(
+            self.rbr_dense.weight + weight_1x1_expanded + weight_identity_expanded)
         self.rbr_dense.bias = torch.nn.Parameter(self.rbr_dense.bias + rbr_1x1_bias + bias_identity_expanded)
-                
+
         self.rbr_reparam = self.rbr_dense
         self.deploy = True
 
@@ -738,6 +777,7 @@ class RepResXCSPC(ResXCSPC):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*[RepResX(c_, c_, shortcut, g, e=0.5) for _ in range(n)])
 
+
 ##### end of repvgg #####
 
 
@@ -788,6 +828,7 @@ class TransformerBlock(nn.Module):
         x = x.reshape(b, self.c2, w, h)
         return x
 
+
 ##### end of transformer #####
 
 
@@ -803,7 +844,7 @@ class Focus(nn.Module):
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
         return self.conv(torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1))
         # return self.conv(self.contract(x))
-        
+
 
 class SPPF(nn.Module):
     # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
@@ -819,8 +860,8 @@ class SPPF(nn.Module):
         y1 = self.m(x)
         y2 = self.m(y1)
         return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
-    
-    
+
+
 class Contract(nn.Module):
     # Contract width-height into channels, i.e. x(1,64,80,80) to x(1,256,40,40)
     def __init__(self, gain=2):
@@ -1024,6 +1065,7 @@ class Classify(nn.Module):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
 
+
 ##### end of yolov5 ######
 
 
@@ -1033,11 +1075,11 @@ def transI_fusebn(kernel, bn):
     gamma = bn.weight
     std = (bn.running_var + bn.eps).sqrt()
     return kernel * ((gamma / std).reshape(-1, 1, 1, 1)), bn.bias - bn.running_mean * gamma / std
-    
-    
+
+
 class ConvBN(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,
-                             stride=1, padding=0, dilation=1, groups=1, deploy=False, nonlinear=None):
+                 stride=1, padding=0, dilation=1, groups=1, deploy=False, nonlinear=None):
         super().__init__()
         if nonlinear is None:
             self.nonlinear = nn.Identity()
@@ -1045,10 +1087,10 @@ class ConvBN(nn.Module):
             self.nonlinear = nonlinear
         if deploy:
             self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                                      stride=stride, padding=padding, dilation=dilation, groups=groups, bias=True)
+                                  stride=stride, padding=padding, dilation=dilation, groups=groups, bias=True)
         else:
             self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                                            stride=stride, padding=padding, dilation=dilation, groups=groups, bias=False)
+                                  stride=stride, padding=padding, dilation=dilation, groups=groups, bias=False)
             self.bn = nn.BatchNorm2d(num_features=out_channels)
 
     def forward(self, x):
@@ -1059,15 +1101,18 @@ class ConvBN(nn.Module):
 
     def switch_to_deploy(self):
         kernel, bias = transI_fusebn(self.conv.weight, self.bn)
-        conv = nn.Conv2d(in_channels=self.conv.in_channels, out_channels=self.conv.out_channels, kernel_size=self.conv.kernel_size,
-                                      stride=self.conv.stride, padding=self.conv.padding, dilation=self.conv.dilation, groups=self.conv.groups, bias=True)
+        conv = nn.Conv2d(in_channels=self.conv.in_channels, out_channels=self.conv.out_channels,
+                         kernel_size=self.conv.kernel_size,
+                         stride=self.conv.stride, padding=self.conv.padding, dilation=self.conv.dilation,
+                         groups=self.conv.groups, bias=True)
         conv.weight.data = kernel
         conv.bias.data = bias
         for para in self.parameters():
             para.detach_()
         self.__delattr__('conv')
         self.__delattr__('bn')
-        self.conv = conv    
+        self.conv = conv
+
 
 class OREPA_3x3_RepConv(nn.Module):
 
@@ -1095,19 +1140,20 @@ class OREPA_3x3_RepConv(nn.Module):
 
         self.branch_counter = 0
 
-        self.weight_rbr_origin = nn.Parameter(torch.Tensor(out_channels, int(in_channels/self.groups), kernel_size, kernel_size))
+        self.weight_rbr_origin = nn.Parameter(
+            torch.Tensor(out_channels, int(in_channels / self.groups), kernel_size, kernel_size))
         nn.init.kaiming_uniform_(self.weight_rbr_origin, a=math.sqrt(1.0))
         self.branch_counter += 1
 
-
         if groups < out_channels:
-            self.weight_rbr_avg_conv = nn.Parameter(torch.Tensor(out_channels, int(in_channels/self.groups), 1, 1))
-            self.weight_rbr_pfir_conv = nn.Parameter(torch.Tensor(out_channels, int(in_channels/self.groups), 1, 1))
+            self.weight_rbr_avg_conv = nn.Parameter(torch.Tensor(out_channels, int(in_channels / self.groups), 1, 1))
+            self.weight_rbr_pfir_conv = nn.Parameter(torch.Tensor(out_channels, int(in_channels / self.groups), 1, 1))
             nn.init.kaiming_uniform_(self.weight_rbr_avg_conv, a=1.0)
             nn.init.kaiming_uniform_(self.weight_rbr_pfir_conv, a=1.0)
             self.weight_rbr_avg_conv.data
             self.weight_rbr_pfir_conv.data
-            self.register_buffer('weight_rbr_avg_avg', torch.ones(kernel_size, kernel_size).mul(1.0/kernel_size/kernel_size))
+            self.register_buffer('weight_rbr_avg_avg',
+                                 torch.ones(kernel_size, kernel_size).mul(1.0 / kernel_size / kernel_size))
             self.branch_counter += 1
 
         else:
@@ -1115,26 +1161,29 @@ class OREPA_3x3_RepConv(nn.Module):
         self.branch_counter += 1
 
         if internal_channels_1x1_3x3 is None:
-            internal_channels_1x1_3x3 = in_channels if groups < out_channels else 2 * in_channels   # For mobilenet, it is better to have 2X internal channels
+            internal_channels_1x1_3x3 = in_channels if groups < out_channels else 2 * in_channels  # For mobilenet, it is better to have 2X internal channels
 
         if internal_channels_1x1_3x3 == in_channels:
-            self.weight_rbr_1x1_kxk_idconv1 = nn.Parameter(torch.zeros(in_channels, int(in_channels/self.groups), 1, 1))
-            id_value = np.zeros((in_channels, int(in_channels/self.groups), 1, 1))
+            self.weight_rbr_1x1_kxk_idconv1 = nn.Parameter(
+                torch.zeros(in_channels, int(in_channels / self.groups), 1, 1))
+            id_value = np.zeros((in_channels, int(in_channels / self.groups), 1, 1))
             for i in range(in_channels):
-                id_value[i, i % int(in_channels/self.groups), 0, 0] = 1
+                id_value[i, i % int(in_channels / self.groups), 0, 0] = 1
             id_tensor = torch.from_numpy(id_value).type_as(self.weight_rbr_1x1_kxk_idconv1)
             self.register_buffer('id_tensor', id_tensor)
 
         else:
-            self.weight_rbr_1x1_kxk_conv1 = nn.Parameter(torch.Tensor(internal_channels_1x1_3x3, int(in_channels/self.groups), 1, 1))
+            self.weight_rbr_1x1_kxk_conv1 = nn.Parameter(
+                torch.Tensor(internal_channels_1x1_3x3, int(in_channels / self.groups), 1, 1))
             nn.init.kaiming_uniform_(self.weight_rbr_1x1_kxk_conv1, a=math.sqrt(1.0))
-        self.weight_rbr_1x1_kxk_conv2 = nn.Parameter(torch.Tensor(out_channels, int(internal_channels_1x1_3x3/self.groups), kernel_size, kernel_size))
+        self.weight_rbr_1x1_kxk_conv2 = nn.Parameter(
+            torch.Tensor(out_channels, int(internal_channels_1x1_3x3 / self.groups), kernel_size, kernel_size))
         nn.init.kaiming_uniform_(self.weight_rbr_1x1_kxk_conv2, a=math.sqrt(1.0))
         self.branch_counter += 1
 
         expand_ratio = 8
-        self.weight_rbr_gconv_dw = nn.Parameter(torch.Tensor(in_channels*expand_ratio, 1, kernel_size, kernel_size))
-        self.weight_rbr_gconv_pw = nn.Parameter(torch.Tensor(out_channels, in_channels*expand_ratio, 1, 1))
+        self.weight_rbr_gconv_dw = nn.Parameter(torch.Tensor(in_channels * expand_ratio, 1, kernel_size, kernel_size))
+        self.weight_rbr_gconv_pw = nn.Parameter(torch.Tensor(out_channels, in_channels * expand_ratio, 1, 1))
         nn.init.kaiming_uniform_(self.weight_rbr_gconv_dw, a=math.sqrt(1.0))
         nn.init.kaiming_uniform_(self.weight_rbr_gconv_pw, a=math.sqrt(1.0))
         self.branch_counter += 1
@@ -1147,23 +1196,22 @@ class OREPA_3x3_RepConv(nn.Module):
 
         self.fre_init()
 
-        nn.init.constant_(self.vector[0, :], 0.25)    #origin
-        nn.init.constant_(self.vector[1, :], 0.25)      #avg
-        nn.init.constant_(self.vector[2, :], 0.0)      #prior
-        nn.init.constant_(self.vector[3, :], 0.5)    #1x1_kxk
-        nn.init.constant_(self.vector[4, :], 0.5)     #dws_conv
-
+        nn.init.constant_(self.vector[0, :], 0.25)  # origin
+        nn.init.constant_(self.vector[1, :], 0.25)  # avg
+        nn.init.constant_(self.vector[2, :], 0.0)  # prior
+        nn.init.constant_(self.vector[3, :], 0.5)  # 1x1_kxk
+        nn.init.constant_(self.vector[4, :], 0.5)  # dws_conv
 
     def fre_init(self):
         prior_tensor = torch.Tensor(self.out_channels, self.kernel_size, self.kernel_size)
-        half_fg = self.out_channels/2
+        half_fg = self.out_channels / 2
         for i in range(self.out_channels):
             for h in range(3):
                 for w in range(3):
                     if i < half_fg:
-                        prior_tensor[i, h, w] = math.cos(math.pi*(h+0.5)*(i+1)/3)
+                        prior_tensor[i, h, w] = math.cos(math.pi * (h + 0.5) * (i + 1) / 3)
                     else:
-                        prior_tensor[i, h, w] = math.cos(math.pi*(w+0.5)*(i+1-half_fg)/3)
+                        prior_tensor[i, h, w] = math.cos(math.pi * (w + 0.5) * (i + 1 - half_fg) / 3)
 
         self.register_buffer('weight_rbr_prior', prior_tensor)
 
@@ -1171,9 +1219,13 @@ class OREPA_3x3_RepConv(nn.Module):
 
         weight_rbr_origin = torch.einsum('oihw,o->oihw', self.weight_rbr_origin, self.vector[0, :])
 
-        weight_rbr_avg = torch.einsum('oihw,o->oihw', torch.einsum('oihw,hw->oihw', self.weight_rbr_avg_conv, self.weight_rbr_avg_avg), self.vector[1, :])
-        
-        weight_rbr_pfir = torch.einsum('oihw,o->oihw', torch.einsum('oihw,ohw->oihw', self.weight_rbr_pfir_conv, self.weight_rbr_prior), self.vector[2, :])
+        weight_rbr_avg = torch.einsum('oihw,o->oihw',
+                                      torch.einsum('oihw,hw->oihw', self.weight_rbr_avg_conv, self.weight_rbr_avg_avg),
+                                      self.vector[1, :])
+
+        weight_rbr_pfir = torch.einsum('oihw,o->oihw',
+                                       torch.einsum('oihw,ohw->oihw', self.weight_rbr_pfir_conv, self.weight_rbr_prior),
+                                       self.vector[2, :])
 
         weight_rbr_1x1_kxk_conv1 = None
         if hasattr(self, 'weight_rbr_1x1_kxk_idconv1'):
@@ -1188,42 +1240,46 @@ class OREPA_3x3_RepConv(nn.Module):
             g = self.groups
             t, ig = weight_rbr_1x1_kxk_conv1.size()
             o, tg, h, w = weight_rbr_1x1_kxk_conv2.size()
-            weight_rbr_1x1_kxk_conv1 = weight_rbr_1x1_kxk_conv1.view(g, int(t/g), ig)
-            weight_rbr_1x1_kxk_conv2 = weight_rbr_1x1_kxk_conv2.view(g, int(o/g), tg, h, w)
-            weight_rbr_1x1_kxk = torch.einsum('gti,gothw->goihw', weight_rbr_1x1_kxk_conv1, weight_rbr_1x1_kxk_conv2).view(o, ig, h, w)
+            weight_rbr_1x1_kxk_conv1 = weight_rbr_1x1_kxk_conv1.view(g, int(t / g), ig)
+            weight_rbr_1x1_kxk_conv2 = weight_rbr_1x1_kxk_conv2.view(g, int(o / g), tg, h, w)
+            weight_rbr_1x1_kxk = torch.einsum('gti,gothw->goihw', weight_rbr_1x1_kxk_conv1,
+                                              weight_rbr_1x1_kxk_conv2).view(o, ig, h, w)
         else:
             weight_rbr_1x1_kxk = torch.einsum('ti,othw->oihw', weight_rbr_1x1_kxk_conv1, weight_rbr_1x1_kxk_conv2)
 
         weight_rbr_1x1_kxk = torch.einsum('oihw,o->oihw', weight_rbr_1x1_kxk, self.vector[3, :])
 
         weight_rbr_gconv = self.dwsc2full(self.weight_rbr_gconv_dw, self.weight_rbr_gconv_pw, self.in_channels)
-        weight_rbr_gconv = torch.einsum('oihw,o->oihw', weight_rbr_gconv, self.vector[4, :])    
+        weight_rbr_gconv = torch.einsum('oihw,o->oihw', weight_rbr_gconv, self.vector[4, :])
 
         weight = weight_rbr_origin + weight_rbr_avg + weight_rbr_1x1_kxk + weight_rbr_pfir + weight_rbr_gconv
 
         return weight
 
     def dwsc2full(self, weight_dw, weight_pw, groups):
-        
+
         t, ig, h, w = weight_dw.size()
         o, _, _, _ = weight_pw.size()
-        tg = int(t/groups)
-        i = int(ig*groups)
+        tg = int(t / groups)
+        i = int(ig * groups)
         weight_dw = weight_dw.view(groups, tg, ig, h, w)
         weight_pw = weight_pw.squeeze().view(o, groups, tg)
-        
+
         weight_dsc = torch.einsum('gtihw,ogt->ogihw', weight_dw, weight_pw)
         return weight_dsc.view(o, i, h, w)
 
     def forward(self, inputs):
         weight = self.weight_gen()
-        out = F.conv2d(inputs, weight, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
+        out = F.conv2d(inputs, weight, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation,
+                       groups=self.groups)
 
         return self.nonlinear(self.bn(out))
 
+
 class RepConv_OREPA(nn.Module):
 
-    def __init__(self, c1, c2, k=3, s=1, padding=1, dilation=1, groups=1, padding_mode='zeros', deploy=False, use_se=False, nonlinear=nn.SiLU()):
+    def __init__(self, c1, c2, k=3, s=1, padding=1, dilation=1, groups=1, padding_mode='zeros', deploy=False,
+                 use_se=False, nonlinear=nn.SiLU()):
         super(RepConv_OREPA, self).__init__()
         self.deploy = deploy
         self.groups = groups
@@ -1250,15 +1306,19 @@ class RepConv_OREPA(nn.Module):
             self.se = nn.Identity()
 
         if deploy:
-            self.rbr_reparam = nn.Conv2d(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=k, stride=s,
-                                      padding=padding, dilation=dilation, groups=groups, bias=True, padding_mode=padding_mode)
+            self.rbr_reparam = nn.Conv2d(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=k,
+                                         stride=s,
+                                         padding=padding, dilation=dilation, groups=groups, bias=True,
+                                         padding_mode=padding_mode)
 
         else:
-            self.rbr_identity = nn.BatchNorm2d(num_features=self.in_channels) if self.out_channels == self.in_channels and s == 1 else None
-            self.rbr_dense = OREPA_3x3_RepConv(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=k, stride=s, padding=padding, groups=groups, dilation=1)
-            self.rbr_1x1 = ConvBN(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=1, stride=s, padding=padding_11, groups=groups, dilation=1)
+            self.rbr_identity = nn.BatchNorm2d(
+                num_features=self.in_channels) if self.out_channels == self.in_channels and s == 1 else None
+            self.rbr_dense = OREPA_3x3_RepConv(in_channels=self.in_channels, out_channels=self.out_channels,
+                                               kernel_size=k, stride=s, padding=padding, groups=groups, dilation=1)
+            self.rbr_1x1 = ConvBN(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=1, stride=s,
+                                  padding=padding_11, groups=groups, dilation=1)
             print('RepVGG Block, identity = ', self.rbr_identity)
-
 
     def forward(self, inputs):
         if hasattr(self, 'rbr_reparam'):
@@ -1276,7 +1336,6 @@ class RepConv_OREPA(nn.Module):
 
         return self.nonlinearity(self.se(out))
 
-
     #   Optional. This improves the accuracy and facilitates quantization.
     #   1.  Cancel the original weight decay on rbr_dense.conv.weight and rbr_1x1.conv.weight.
     #   2.  Use like this.
@@ -1290,12 +1349,17 @@ class RepConv_OREPA(nn.Module):
     def get_custom_L2(self):
         K3 = self.rbr_dense.weight_gen()
         K1 = self.rbr_1x1.conv.weight
-        t3 = (self.rbr_dense.bn.weight / ((self.rbr_dense.bn.running_var + self.rbr_dense.bn.eps).sqrt())).reshape(-1, 1, 1, 1).detach()
-        t1 = (self.rbr_1x1.bn.weight / ((self.rbr_1x1.bn.running_var + self.rbr_1x1.bn.eps).sqrt())).reshape(-1, 1, 1, 1).detach()
+        t3 = (self.rbr_dense.bn.weight / ((self.rbr_dense.bn.running_var + self.rbr_dense.bn.eps).sqrt())).reshape(-1,
+                                                                                                                   1, 1,
+                                                                                                                   1).detach()
+        t1 = (self.rbr_1x1.bn.weight / ((self.rbr_1x1.bn.running_var + self.rbr_1x1.bn.eps).sqrt())).reshape(-1, 1, 1,
+                                                                                                             1).detach()
 
-        l2_loss_circle = (K3 ** 2).sum() - (K3[:, :, 1:2, 1:2] ** 2).sum()      # The L2 loss of the "circle" of weights in 3x3 kernel. Use regular L2 on them.
-        eq_kernel = K3[:, :, 1:2, 1:2] * t3 + K1 * t1                           # The equivalent resultant central point of 3x3 kernel.
-        l2_loss_eq_kernel = (eq_kernel ** 2 / (t3 ** 2 + t1 ** 2)).sum()        # Normalize for an L2 coefficient comparable to regular L2.
+        l2_loss_circle = (K3 ** 2).sum() - (K3[:, :, 1:2,
+                                            1:2] ** 2).sum()  # The L2 loss of the "circle" of weights in 3x3 kernel. Use regular L2 on them.
+        eq_kernel = K3[:, :, 1:2, 1:2] * t3 + K1 * t1  # The equivalent resultant central point of 3x3 kernel.
+        l2_loss_eq_kernel = (eq_kernel ** 2 / (
+                    t3 ** 2 + t1 ** 2)).sum()  # Normalize for an L2 coefficient comparable to regular L2.
         return l2_loss_eq_kernel + l2_loss_circle
 
     def get_equivalent_kernel_bias(self):
@@ -1308,7 +1372,7 @@ class RepConv_OREPA(nn.Module):
         if kernel1x1 is None:
             return 0
         else:
-            return torch.nn.functional.pad(kernel1x1, [1,1,1,1])
+            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, branch):
         if branch is None:
@@ -1349,7 +1413,8 @@ class RepConv_OREPA(nn.Module):
         kernel, bias = self.get_equivalent_kernel_bias()
         self.rbr_reparam = nn.Conv2d(in_channels=self.rbr_dense.in_channels, out_channels=self.rbr_dense.out_channels,
                                      kernel_size=self.rbr_dense.kernel_size, stride=self.rbr_dense.stride,
-                                     padding=self.rbr_dense.padding, dilation=self.rbr_dense.dilation, groups=self.rbr_dense.groups, bias=True)
+                                     padding=self.rbr_dense.padding, dilation=self.rbr_dense.dilation,
+                                     groups=self.rbr_dense.groups, bias=True)
         self.rbr_reparam.weight.data = kernel
         self.rbr_reparam.bias.data = bias
         for para in self.parameters():
@@ -1357,13 +1422,13 @@ class RepConv_OREPA(nn.Module):
         self.__delattr__('rbr_dense')
         self.__delattr__('rbr_1x1')
         if hasattr(self, 'rbr_identity'):
-            self.__delattr__('rbr_identity') 
+            self.__delattr__('rbr_identity')
 
-##### end of orepa #####
+        ##### end of orepa #####
 
 
 ##### swin transformer #####    
-    
+
 class WindowAttention(nn.Module):
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -1428,11 +1493,12 @@ class WindowAttention(nn.Module):
         try:
             x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         except:
-            #print(attn.dtype, v.dtype)
+            # print(attn.dtype, v.dtype)
             x = (attn.half() @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 class Mlp(nn.Module):
 
@@ -1453,16 +1519,16 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-def window_partition(x, window_size):
 
+def window_partition(x, window_size):
     B, H, W, C = x.shape
     assert H % window_size == 0, 'feature map h and w can not divide by window size'
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
+
 def window_reverse(windows, window_size, H, W):
-    
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
@@ -1523,7 +1589,7 @@ class SwinTransformerLayer(nn.Module):
         _, _, H_, W_ = x.shape
 
         Padding = False
-        if min(H_, W_) < self.window_size or H_ % self.window_size!=0 or W_ % self.window_size!=0:
+        if min(H_, W_) < self.window_size or H_ % self.window_size != 0 or W_ % self.window_size != 0:
             Padding = True
             # print(f'img_size {min(H_, W_)} is less than (or not divided by) window_size {self.window_size}, Padding.')
             pad_r = (self.window_size - W_ % self.window_size) % self.window_size
@@ -1590,7 +1656,8 @@ class SwinTransformerBlock(nn.Module):
 
         # remove input_resolution
         self.blocks = nn.Sequential(*[SwinTransformerLayer(dim=c2, num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2) for i in range(num_layers)])
+                                                           shift_size=0 if (i % 2 == 0) else window_size // 2) for i in
+                                      range(num_layers)])
 
     def forward(self, x):
         if self.conv is not None:
@@ -1609,7 +1676,7 @@ class STCSPA(nn.Module):
         self.cv3 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformerBlock(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.m(self.cv1(x))
@@ -1627,7 +1694,7 @@ class STCSPB(nn.Module):
         self.cv3 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformerBlock(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         x1 = self.cv1(x)
@@ -1647,18 +1714,19 @@ class STCSPC(nn.Module):
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformerBlock(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
         y2 = self.cv2(x)
         return self.cv4(torch.cat((y1, y2), dim=1))
 
-##### end of swin transformer #####   
+
+##### end of swin transformer #####
 
 
 ##### swin transformer v2 ##### 
-  
+
 class WindowAttention_v2(nn.Module):
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.,
@@ -1721,7 +1789,7 @@ class WindowAttention_v2(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, mask=None):
-        
+
         B_, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None:
@@ -1756,7 +1824,7 @@ class WindowAttention_v2(nn.Module):
             x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         except:
             x = (attn.half() @ v).transpose(1, 2).reshape(B_, N, C)
-            
+
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -1777,7 +1845,8 @@ class WindowAttention_v2(nn.Module):
         # x = self.proj(x)
         flops += N * self.dim * self.dim
         return flops
-    
+
+
 class Mlp_v2(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.):
         super().__init__()
@@ -1798,7 +1867,6 @@ class Mlp_v2(nn.Module):
 
 
 def window_partition_v2(x, window_size):
-    
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
@@ -1806,7 +1874,6 @@ def window_partition_v2(x, window_size):
 
 
 def window_reverse_v2(windows, window_size, H, W):
-    
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
@@ -1820,12 +1887,12 @@ class SwinTransformerLayer_v2(nn.Module):
                  act_layer=nn.SiLU, norm_layer=nn.LayerNorm, pretrained_window_size=0):
         super().__init__()
         self.dim = dim
-        #self.input_resolution = input_resolution
+        # self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        #if min(self.input_resolution) <= self.window_size:
+        # if min(self.input_resolution) <= self.window_size:
         #    # if window size is larger than input resolution, we don't partition windows
         #    self.shift_size = 0
         #    self.window_size = min(self.input_resolution)
@@ -1869,7 +1936,7 @@ class SwinTransformerLayer_v2(nn.Module):
         _, _, H_, W_ = x.shape
 
         Padding = False
-        if min(H_, W_) < self.window_size or H_ % self.window_size!=0 or W_ % self.window_size!=0:
+        if min(H_, W_) < self.window_size or H_ % self.window_size != 0 or W_ % self.window_size != 0:
             Padding = True
             # print(f'img_size {min(H_, W_)} is less than (or not divided by) window_size {self.window_size}, Padding.')
             pad_r = (self.window_size - W_ % self.window_size) % self.window_size
@@ -1918,7 +1985,7 @@ class SwinTransformerLayer_v2(nn.Module):
         # FFN
         x = x + self.drop_path(self.norm2(self.mlp(x)))
         x = x.permute(0, 2, 1).contiguous().view(-1, C, H, W)  # b c h w
-        
+
         if Padding:
             x = x[:, :, :H_, :W_]  # reverse padding
 
@@ -1952,7 +2019,8 @@ class SwinTransformer2Block(nn.Module):
 
         # remove input_resolution
         self.blocks = nn.Sequential(*[SwinTransformerLayer_v2(dim=c2, num_heads=num_heads, window_size=window_size,
-                                 shift_size=0 if (i % 2 == 0) else window_size // 2) for i in range(num_layers)])
+                                                              shift_size=0 if (i % 2 == 0) else window_size // 2) for i
+                                      in range(num_layers)])
 
     def forward(self, x):
         if self.conv is not None:
@@ -1971,7 +2039,7 @@ class ST2CSPA(nn.Module):
         self.cv3 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformer2Block(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.m(self.cv1(x))
@@ -1989,7 +2057,7 @@ class ST2CSPB(nn.Module):
         self.cv3 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformer2Block(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         x1 = self.cv1(x)
@@ -2009,11 +2077,11 @@ class ST2CSPC(nn.Module):
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         num_heads = c_ // 32
         self.m = SwinTransformer2Block(c_, c_, num_heads, n)
-        #self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        # self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
         y2 = self.cv2(x)
         return self.cv4(torch.cat((y1, y2), dim=1))
 
-##### end of swin transformer v2 #####   
+##### end of swin transformer v2 #####
